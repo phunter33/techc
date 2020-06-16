@@ -1,1 +1,418 @@
+Description: AWS VPC
 
+Parameters:
+  VpcCidrBlock:
+    Description: The VPC CIDR block
+    Type: String
+
+  PrimaryPublicSubnetCidrBlock:
+    Description: The Pimary Public Subnet CIDR block
+    Type: String
+
+  SecondaryPublicSubnetCidrBlock:
+    Description: The Secondary Public Subnet CIDR block
+    Type: String
+
+  PrimaryAppSubnetCidrBlock:
+    Description: The Pimary App Subnet CIDR block
+    Type: String
+
+  SecondaryAppSubnetCidrBlock:
+    Description: The Secondary App Subnet CIDR block
+    Type: String
+
+  PrimaryBackendSubnetCidrBlock:
+    Description: The Pimary Backend Subnet CIDR block
+    Type: String
+
+  SecondaryBackendSubnetCidrBlock:
+    Description: The Secondary Backend Subnet CIDR block
+    Type: String
+
+  NatGateway:
+    # Because NAT gateways cost money, we can add a parameter with a
+    # default value to the `Parameters` section, so that we don't
+    # actually create them by default.
+    Description: Set if you want to use a NAT Gateway
+    Type: String
+    Default: ""
+
+Conditions:
+  # Don't create
+  CreateNatGateway: !Not [!Equals [!Ref NatGateway, ""]]
+
+Resources:
+  Vpc:
+    Type: AWS::EC2::VPC
+    Properties:
+      CidrBlock: !Ref VpcCidrBlock
+      EnableDnsHostnames: true
+      EnableDnsSupport: true
+      Tags:
+        - Key: Name
+          Value: !Sub ${AWS::StackName}
+
+  Ipv6VpcCidrBlock:
+    # An IPv6 CIDR block isn't required
+    Type: AWS::EC2::VPCCidrBlock
+    Properties:
+      AmazonProvidedIpv6CidrBlock: true
+      VpcId: !Ref Vpc
+    DependsOn:
+      - Vpc
+
+  InternetGateway:
+    # internet gateway, attached to VPC.
+    Type: AWS::EC2::InternetGateway
+
+  VPCGatewayAttachment:
+    Type: AWS::EC2::VPCGatewayAttachment
+    Properties:
+      VpcId:
+        Ref: Vpc
+      InternetGatewayId:
+        Ref: InternetGateway
+    DependsOn:
+      - Vpc
+      - InternetGateway
+
+  PublicRouteTable:
+    # Create a custom route table with the route to the internet gateway.
+    # It's bad practice to use the main route table for everything.
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId:
+        Ref: Vpc
+      Tags:
+        - Key: Name
+          Value: !Sub ${AWS::StackName}-public
+    DependsOn:
+      - Vpc
+
+  PublicRoute:
+    # route nees a destination CIDR and a target.
+    # match the outbound connection
+    # and the target is where it should be routed to, so for internet traffic,
+    # also the router will prefer a static IP over a dynamic one.
+    Type: AWS::EC2::Route
+    Properties:
+      DestinationCidrBlock: 0.0.0.0/0
+      GatewayId: !Ref InternetGateway
+      RouteTableId: !Ref PublicRouteTable
+    DependsOn:
+      - InternetGateway
+      - PublicRouteTable
+
+  PrimaryPublicSubnet:
+    # public subnet with access to the internet,
+    # going to make sure that we have public IP addresses by default.
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId:
+        !Ref Vpc
+      CidrBlock: !Ref PrimaryPublicSubnetCidrBlock
+      AvailabilityZone: !Select [0, !GetAZs ""]
+      MapPublicIpOnLaunch: true
+      Tags:
+        - Key: Name
+          Value: !Sub ${AWS::StackName}-public-primary
+    DependsOn:
+      - Vpc
+
+  PrimaryPublicSubnetRouteTableAssociation:
+    # associates subnet with your routing table.
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      RouteTableId: !Ref PublicRouteTable
+      SubnetId: !Ref PrimaryPublicSubnet
+    DependsOn:
+      - PublicRoute
+      - PrimaryPublicSubnet
+
+  SecondaryPublicSubnet:
+    # secondary for redundancy and high availabilty.
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId:
+        !Ref Vpc
+      CidrBlock: !Ref SecondaryPublicSubnetCidrBlock
+      AvailabilityZone: !Select [1, !GetAZs ""]
+      MapPublicIpOnLaunch: true
+      Tags:
+        - Key: Name
+          Value: !Sub ${AWS::StackName}-public-secondary
+    DependsOn:
+      - Vpc
+
+  SecondaryPublicSubnetRouteTableAssociation:
+    # Notice in this case we're sharing one routing table.
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      RouteTableId: !Ref PublicRouteTable
+      SubnetId: !Ref SecondaryPublicSubnet
+    DependsOn:
+      - PublicRouteTable
+      - SecondaryPublicSubnet
+
+  PrimaryAppElasticIp:
+    # public Elastic IP is required for NAT gateway.
+    Type: AWS::EC2::EIP
+    Condition: CreateNatGateway
+    Properties:
+      Domain: vpc
+      Tags:
+        - Key: Name
+          Value: !Sub ${AWS::StackName}-nat-primary
+
+  PrimaryAppNatGateway:
+    # NAT gateway route to the internet gateway
+    # public Elastic IP address
+    Type: AWS::EC2::NatGateway
+    Condition: CreateNatGateway
+    Properties:
+      AllocationId: !GetAtt PrimaryAppElasticIp.AllocationId
+      SubnetId: !Ref PrimaryPublicSubnet
+      Tags:
+        - Key: Name
+          Value: !Sub ${AWS::StackName}-nat-primary
+    DependsOn:
+      - PrimaryPublicSubnet
+      - PrimaryAppElasticIp
+
+  PrimaryAppRouteTable:
+    # Create a custom route table, which includes a route to the NAT gateway
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId:
+        Ref: Vpc
+      Tags:
+        - Key: Name
+          Value: !Sub ${AWS::StackName}-app-primary
+    DependsOn:
+      - Vpc
+
+  PrimaryAppRoute:
+    # This is the route for the NAT Gateway and condition.
+    Type: AWS::EC2::Route
+    Condition: CreateNatGateway
+    Properties:
+      NatGatewayId: !Ref PrimaryAppNatGateway
+      DestinationCidrBlock: 0.0.0.0/0
+      RouteTableId: !Ref PrimaryAppRouteTable
+    DependsOn:
+      - PrimaryAppNatGateway
+      - PrimaryAppRouteTable
+
+  PrimaryAppSubnet:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId:
+        !Ref Vpc
+      CidrBlock: !Ref PrimaryAppSubnetCidrBlock
+      AvailabilityZone: !Select [0, !GetAZs ""]
+      Tags:
+        - Key: Name
+          Value: !Sub ${AWS::StackName}-app-primary
+    DependsOn:
+      - Vpc
+
+  PrimaryAppSubnetRouteTableAssociation:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      RouteTableId: !Ref PrimaryAppRouteTable
+      SubnetId: !Ref PrimaryAppSubnet
+    DependsOn:
+      - PrimaryAppRouteTable
+      - PrimaryAppSubnet
+
+# resources for our failover: 
+  SecondaryAppElasticIp:
+    Type: AWS::EC2::EIP
+    Condition: CreateNatGateway
+    Properties:
+      Domain: vpc
+      Tags:
+        - Key: Name
+          Value: !Sub ${AWS::StackName}-nat-secondary
+
+  SecondaryAppNatGateway:
+    Type: AWS::EC2::NatGateway
+    Condition: CreateNatGateway
+    Properties:
+      AllocationId: !GetAtt SecondaryAppElasticIp.AllocationId
+      SubnetId: !Ref SecondaryPublicSubnet
+      Tags:
+        - Key: Name
+          Value: !Sub ${AWS::StackName}-nat-secondary
+    DependsOn:
+      - SecondaryPublicSubnet
+      - SecondaryAppElasticIp
+
+  SecondaryAppRouteTable:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId:
+        Ref: Vpc
+      Tags:
+        - Key: Name
+          Value: !Sub ${AWS::StackName}-app-secondary
+    DependsOn:
+      - Vpc
+
+  SecondaryAppRoute:
+    Type: AWS::EC2::Route
+    Condition: CreateNatGateway
+    Properties:
+      NatGatewayId: !Ref SecondaryAppNatGateway
+      DestinationCidrBlock: 0.0.0.0/0
+      RouteTableId: !Ref SecondaryAppRouteTable
+    DependsOn:
+      - SecondaryAppNatGateway
+      - SecondaryAppRouteTable
+
+  SecondaryAppSubnet:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId:
+        !Ref Vpc
+      CidrBlock: !Ref SecondaryAppSubnetCidrBlock
+      AvailabilityZone: !Select [1, !GetAZs ""]
+      Tags:
+        - Key: Name
+          Value: !Sub ${AWS::StackName}-app-secondary
+    DependsOn:
+      - Vpc
+
+  SecondaryAppSubnetRouteTableAssociation:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      RouteTableId: !Ref SecondaryAppRouteTable
+      SubnetId: !Ref SecondaryAppSubnet
+    DependsOn:
+      - SecondaryAppRouteTable
+      - SecondaryAppSubnet
+
+
+  BackendRouteTable:
+    # Create a route table for the backend.
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId:
+        Ref: Vpc
+      Tags:
+        - Key: Name
+          Value: !Sub ${AWS::StackName}-backend
+    DependsOn:
+      - Vpc
+
+  PrimaryBackendSubnet:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId:
+        !Ref Vpc
+      CidrBlock: !Ref PrimaryBackendSubnetCidrBlock
+      AvailabilityZone: !Select [0, !GetAZs ""]
+      Tags:
+        - Key: Name
+          Value: !Sub ${AWS::StackName}-backend-primary
+    DependsOn:
+      - Vpc
+
+  PrimaryBackendSubnetRouteTableAssociation:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      RouteTableId: !Ref BackendRouteTable
+      SubnetId: !Ref PrimaryBackendSubnet
+    DependsOn:
+      - BackendRouteTable
+      - PrimaryBackendSubnet
+
+  SecondaryBackendSubnet:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId:
+        !Ref Vpc
+      CidrBlock: !Ref SecondaryBackendSubnetCidrBlock
+      AvailabilityZone: !Select [1, !GetAZs ""]
+      Tags:
+        - Key: Name
+          Value: !Sub ${AWS::StackName}-backend-secondary
+    DependsOn:
+      - Vpc
+
+  SecondaryBackendSubnetRouteTableAssociation:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      RouteTableId: !Ref BackendRouteTable
+      SubnetId: !Ref SecondaryBackendSubnet
+    DependsOn:
+      - BackendRouteTable
+      - SecondaryBackendSubnet
+
+  S3VpcEndpoint:
+    # Add the VPC Endpoint for the S3 service to our VPC's route tables.
+    Type: AWS::EC2::VPCEndpoint
+    Properties:
+      ServiceName: !Sub com.amazonaws.${AWS::Region}.s3
+      VpcEndpointType: Gateway
+      VpcId: !Ref Vpc
+      RouteTableIds:
+        - !Ref PublicRouteTable
+        - !Ref PrimaryAppRouteTable
+        - !Ref SecondaryAppRouteTable
+        - !Ref BackendRouteTable
+    DependsOn:
+      - Vpc
+      - PublicRouteTable
+      - PrimaryAppRouteTable
+      - SecondaryAppRouteTable
+      - BackendRouteTable
+
+  SsmSecurityGroup:
+    # Security Group for the SSM endpoint,
+    # To use the SSM service, we need to allow port 443 inbound traffic.
+    Type: AWS::EC2::SecurityGroup
+    Properties: 
+      GroupDescription: SSM Endpoint
+      GroupName: SsmEndpoint
+      SecurityGroupIngress: 
+        - IpProtocol: tcp
+          CidrIp: !GetAtt Vpc.CidrBlock
+          FromPort: 443
+          ToPort: 443
+        - IpProtocol: tcp
+          CidrIpv6: !Select [0, !GetAtt Vpc.Ipv6CidrBlocks]
+          FromPort: 443
+          ToPort: 443
+      Tags:
+        - Key: Name
+          Value: !Sub ${AWS::StackName}-ssm-endpoint
+      VpcId: !Ref Vpc
+    DependsOn:
+      - Vpc
+      - Ipv6VpcCidrBlock
+
+  SsmVpcEndpoint:
+    # Allow applications can connect to the SSM service for Parameter Store
+    # using PrivateLink to get and decrypt secrets.
+    Type: AWS::EC2::VPCEndpoint
+    Properties:
+      ServiceName: !Sub com.amazonaws.${AWS::Region}.ssm
+      VpcEndpointType: Interface
+      VpcId: !Ref Vpc
+      PrivateDnsEnabled: true
+      SecurityGroupIds:
+        - !Ref SsmSecurityGroup
+      SubnetIds:
+        - !Ref PrimaryAppSubnet
+        - !Ref SecondaryAppSubnet
+    DependsOn:
+      - Vpc
+      - SsmSecurityGroup
+      - PrimaryAppSubnet
+      - SecondaryAppSubnet
+
+Outputs:
+  Vpc:
+    Description: The VPC ID
+    Value: !Ref Vpc
